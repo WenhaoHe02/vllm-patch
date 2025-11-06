@@ -124,6 +124,10 @@ class DynamoNixlConnector:
         )
         self._timing_autolog = _env_flag("NIXL_TIMING_LOG", False)
 
+        # ---- eager adopt on engine switch ----
+        self._last_down_engine_id: Optional[str] = None
+        self._eager_adopt: bool = _env_flag("NIXL_EAGER_ADOPT_ON_SWITCH", True)
+
     # --------- helpers for engine_id check ---------
     def _agents_fingerprint(self, agent_metadata: List[bytes]) -> str:
         h = hashlib.sha1()
@@ -864,8 +868,55 @@ class DynamoNixlConnector:
             logger.warning("[MD-CACHE] adopt failed for engine=%s: %s", engine_id, e)
             return False
 
+    # ---- NEW: 调度层可调用的预备函数（切换 decode 后对每个 prefill rank 调用一次） ----
+    def ensure_down_ready(self,
+                          dst_engine_id: str,
+                          agent_metadata: Optional[List[bytes]] = None,
+                          kv_rows: Optional[List[List[List[int]]]] = None,
+                          num_blocks: Optional[int] = None,
+                          kv_devs: Optional[List[List[List[int]]]] = None,
+                          agent_tp: Optional[int] = None) -> bool:
+        """
+        若 DOWN 路径尚未就绪：
+          1) 优先从本机共享缓存收养；
+          2) 若上层提供了显式 md/kv_rows/num_blocks/agent_tp，则直接 add（幂等）。
+        返回 True 表示句柄已就绪（或已存在），False 表示仍未就绪。
+        """
+        # 已存在 DOWN 信息且已创建过目标字典，视为就绪（更细致的句柄校验在读/写路径仍会强校验）
+        if (self._downscale_info.get(dst_engine_id) is not None and
+                dst_engine_id in self.dst_xfer_side_handles and
+                self.dst_xfer_side_handles.get(dst_engine_id)):
+            return True
+
+        # 尝试从共享缓存 adopt
+        if self._adopt_remote_md_from_cache(dst_engine_id):
+            return True
+
+        # 若调用方提供了完整元数据，直接 add（幂等）
+        if all(x is not None for x in (agent_metadata, kv_rows, num_blocks, agent_tp)):
+            try:
+                kv_rows_norm = self._normalize_kv_rows(dst_engine_id, kv_rows, int(agent_tp))
+                self.add_remote_agent(
+                    engine_id=dst_engine_id,
+                    agent_metadata=self._coerce_agent_metadata(agent_metadata),
+                    agent_tp=int(agent_tp), kv_caches_base_addr=kv_rows_norm,
+                    num_blocks=int(num_blocks), kv_caches_dev_ids=kv_devs
+                )
+                return True
+            except Exception as e:
+                logger.warning("[EAGER-ADD] failed for dst=%s: %s", dst_engine_id, e)
+        return False
+
     def read_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id):
         with self._timing.span("read_blocks"):
+            # 引擎切换时的“eager adopt”
+            if self._eager_adopt and dst_engine_id != getattr(self, "_last_down_engine_id", None):
+                try:
+                    self._adopt_remote_md_from_cache(dst_engine_id)
+                except Exception as _e:
+                    logger.debug("[EAGER-ADOPT][READ] skip: %s", _e)
+                self._last_down_engine_id = dst_engine_id
+
             logger.info("[READ] local=%s staging=%s remote=%s dst_engine=%s",
                         len(local_block_ids), len(staging_block_ids), len(remote_block_ids), dst_engine_id)
             assert len(local_block_ids) == len(staging_block_ids) == len(remote_block_ids), \
@@ -885,6 +936,56 @@ class DynamoNixlConnector:
                                                                                                     staging_ranges)
                 logger.debug("[READ] local_ranges=%s staging_ranges=%s -> rearr_local=%s rearr_staging=%s",
                              local_ranges, staging_ranges, local_rearranging_ranges, staging_rearranging_ranges)
+
+            # --- 就绪等待 + 自动收养（READ 路径也要做，避免句柄未就绪报错） ---
+            wait_ms = int(os.getenv("NIXL_READY_WAIT_MS", "3000"))
+            t0 = time.time()
+            last_missing = "unknown"
+            while True:
+                # 如果本进程还没见过该 dst，引导从缓存 adopt 一次
+                if (dst_engine_id not in self._tp_size
+                        or dst_engine_id not in self.dst_xfer_side_handles
+                        or not self.dst_xfer_side_handles.get(dst_engine_id)):
+                    try:
+                        if self._adopt_remote_md_from_cache(dst_engine_id):
+                            logger.info("[READ][ADOPT] adopted remote metadata for dst=%s", dst_engine_id)
+                    except Exception as _e:
+                        logger.debug("[READ][ADOPT] adopt failed for dst=%s: %s", dst_engine_id, _e)
+
+                downscale_info = self._downscale_info.get(dst_engine_id)
+                tp_multiplier = self._tp_size.get(dst_engine_id, 0) // max(1, self._tp_size.get(self.engine_id, 1))
+
+                if downscale_info is not None:
+                    # READ-DOWN 需要 read_down_src/read_down_dst 句柄 + dst_num_blocks_read
+                    src_ok = ("read_down_src" in self.src_xfer_side_handles and
+                              self.src_xfer_side_handles["read_down_src"] is not None)
+                    dst_ok = (dst_engine_id in self.dst_xfer_side_handles and
+                              "read_down_dst" in self.dst_xfer_side_handles[dst_engine_id] and
+                              self.dst_xfer_side_handles[dst_engine_id]["read_down_dst"] is not None)
+                    nb_ok = (hasattr(self, "dst_num_blocks_read") and
+                             (dst_engine_id in getattr(self, "dst_num_blocks_read", {})))
+                    if src_ok and dst_ok and nb_ok:
+                        break
+                    last_missing = f"read_down_ready(src={src_ok}, dst={dst_ok}, nb={nb_ok})"
+                else:
+                    # READ UP/EQ：需要 src_xfer_side_handles[eff_tp] 和每个 i 的 dst handle
+                    eff_tp = max(1, tp_multiplier) if self._tp_size.get(self.engine_id) else 1
+                    src_ok = (eff_tp in self.src_xfer_side_handles and
+                              self.src_xfer_side_handles.get(eff_tp) is not None)
+                    dst_map = self.dst_xfer_side_handles.get(dst_engine_id) or {}
+                    dst_ok = all((i in dst_map and dst_map[i] is not None) for i in range(eff_tp))
+                    nb_ok = (dst_engine_id in self.dst_num_blocks)
+                    if src_ok and dst_ok and nb_ok:
+                        break
+                    last_missing = (f"read_up_ready(eff_tp={eff_tp}, src={src_ok}, dst={dst_ok}, nb={nb_ok})")
+
+                if (time.time() - t0) * 1000.0 > wait_ms:
+                    raise RuntimeError(
+                        f"[READ] precondition not met on rank={self.rank} dst={dst_engine_id}: {last_missing} ; "
+                        f"_tp_size_keys={list(self._tp_size.keys())} src_keys={list(self.src_xfer_side_handles.keys())} "
+                        f"dst_keys_top={list(self.dst_xfer_side_handles.keys())}"
+                    )
+                time.sleep(0.001)
 
             downscale_info = self._downscale_info.get(dst_engine_id)
             tp_multiplier = self._tp_size[dst_engine_id] // self._tp_size[self.engine_id]
@@ -962,6 +1063,14 @@ class DynamoNixlConnector:
 
     def write_blocks(self, local_block_ids, staging_block_ids, remote_block_ids, dst_engine_id, notify_msg):
         with self._timing.span("write_blocks"):
+            # 引擎切换时的“eager adopt”
+            if self._eager_adopt and dst_engine_id != getattr(self, "_last_down_engine_id", None):
+                try:
+                    self._adopt_remote_md_from_cache(dst_engine_id)
+                except Exception as _e:
+                    logger.debug("[EAGER-ADOPT][WRITE] skip: %s", _e)
+                self._last_down_engine_id = dst_engine_id
+
             try:
                 logger.info("[WRITE] begin dst=%s local=%d staging=%d remote=%d notify_type=%s",
                             dst_engine_id, len(local_block_ids), len(staging_block_ids),
